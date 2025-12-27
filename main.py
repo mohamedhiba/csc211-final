@@ -1,6 +1,7 @@
 import os
 import asyncio
-from typing import List, Optional
+import json
+from typing import List, Optional, Dict
 from urllib.parse import quote
 
 import httpx
@@ -22,7 +23,6 @@ except Exception:
 EMPL_ID = os.getenv("EMPL_ID", "00000000")
 LAST_NAME = os.getenv("LAST_NAME", "LastName")
 
-SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "")
 GOOGLE_AI_STUDIO_API_KEY = os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
 
 # pollinations api for generating images, no key needed
@@ -76,33 +76,52 @@ class RecipeResponse(BaseModel):
     api_used: str
 
 
-async def spoonacular_search(query: str, max_time: int, client: httpx.AsyncClient) -> int:
-    """searches spoonacular api for a recipe and returns the recipe id"""
-    url = "https://api.spoonacular.com/recipes/complexSearch"
-    params = {
-        "query": query,
-        "maxReadyTime": max_time,
-        "number": 1,
-        "apiKey": SPOONACULAR_API_KEY,
-    }
-    r = await client.get(url, params=params, timeout=20)
-    if r.status_code == 401:
-        raise HTTPException(status_code=500, detail="Invalid SPOONACULAR_API_KEY (401).")
-    r.raise_for_status()
-    data = r.json()
-    results = data.get("results", [])
-    if not results:
-        raise HTTPException(status_code=404, detail="No recipes found for that query/time.")
-    return int(results[0]["id"])
+def gemini_generate_recipe_sync(description: str, max_time: int) -> Dict:
+    """generates a recipe using gemini api based on description and max time"""
+    if not GOOGLE_AI_STUDIO_API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_AI_STUDIO_API_KEY.")
+    
+    try:
+        import google.generativeai as genai  # type: ignore
+        genai.configure(api_key=GOOGLE_AI_STUDIO_API_KEY)
+        
+        model = genai.GenerativeModel("gemini-flash-latest")
+        prompt = f"""Generate a recipe based on this description: "{description}"
+The recipe should take no more than {max_time} minutes to prepare and cook.
 
+Return the response as valid JSON with this exact structure:
+{{
+    "title": "Recipe Title",
+    "total_time_minutes": {max_time},
+    "ingredients": [
+        {{"name": "ingredient name", "amount": "amount with units"}},
+        {{"name": "ingredient name", "amount": "amount with units"}}
+    ],
+    "instructions": [
+        "Step 1 instruction",
+        "Step 2 instruction",
+        "Step 3 instruction"
+    ],
+    "blurb": "A short 2-line friendly description of this recipe, keep it simple and student-like"
+}}
 
-async def spoonacular_info(recipe_id: int, client: httpx.AsyncClient) -> dict:
-    """gets all the recipe details from spoonacular using the recipe id"""
-    url = f"https://api.spoonacular.com/recipes/{recipe_id}/information"
-    params = {"apiKey": SPOONACULAR_API_KEY, "includeNutrition": "false"}
-    r = await client.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+Make sure the JSON is valid and the recipe is creative and matches the description. Include at least 3 ingredients and at least 3 steps."""
+        
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", "") or "").strip()
+        
+        # try to extract json from the response (gemini might wrap it in markdown)
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        
+        recipe_data = json.loads(text)
+        return recipe_data
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Gemini returned invalid JSON: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
 
 
 def pollinations_image_url(title: str) -> str:
@@ -111,98 +130,44 @@ def pollinations_image_url(title: str) -> str:
     return POLLINATIONS_BASE + quote(prompt)
 
 
-def extract_instructions(info: dict) -> List[str]:
-    analyzed = info.get("analyzedInstructions") or []
-    steps: List[str] = []
-    if analyzed and analyzed[0].get("steps"):
-        for s in analyzed[0]["steps"]:
-            step_text = (s.get("step") or "").strip()
-            if step_text:
-                steps.append(step_text)
-    else:
-        raw = (info.get("instructions") or "").strip()
-        if raw:
-            steps = [x.strip() for x in raw.split(".") if x.strip()]
-
-    if not steps:
-        steps = ["No step-by-step instructions were returned by the API for this recipe."]
-    return steps
-
-
-def extract_ingredients(info: dict) -> List[Ingredient]:
-    out: List[Ingredient] = []
-    for item in info.get("extendedIngredients", []) or []:
-        name = item.get("name", "ingredient")
-        amt = (item.get("original") or "").strip()
-        out.append(Ingredient(name=name, amount=amt if amt else name))
-    if not out:
-        out = [Ingredient(name="N/A", amount="No ingredients returned by the API.")]
-    return out
-
-
-def gemini_blurb_sync(title: str) -> str:
-    """calls gemini api to generate a blurb about the recipe, runs in thread so it doesn't block"""
-    if not GOOGLE_AI_STUDIO_API_KEY:
-        return "AI Studio key not set. (Set GOOGLE_AI_STUDIO_API_KEY to enable Gemini blurb.)"
-
-    try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=GOOGLE_AI_STUDIO_API_KEY)
-
-        model = genai.GenerativeModel("gemini-flash-latest")
-        prompt = (
-            f"Write a short, friendly 2-line description for the recipe '{title}'. "
-            f"Keep it simple and student-like, no fancy tone."
-        )
-        resp = model.generate_content(prompt)
-        text = (getattr(resp, "text", "") or "").strip()
-        return text if text else "Gemini returned an empty response."
-    except Exception as e:
-        return f"Gemini error: {e}"
-
-
 @app.post("/recipe", response_model=RecipeResponse)
 async def recipe(req: RecipeRequest):
     """
     endpoint #2 - main recipe endpoint
-    uses spoonacular for recipes, pollinations for images, and gemini for the blurb
+    uses gemini to generate original recipes, pollinations for images
     """
-    if not SPOONACULAR_API_KEY:
-        raise HTTPException(status_code=500, detail="Server missing SPOONACULAR_API_KEY.")
+    if not GOOGLE_AI_STUDIO_API_KEY:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_AI_STUDIO_API_KEY.")
 
     query = req.description.strip()
     max_time = req.max_time
 
-    async with httpx.AsyncClient() as client:
-        # first find the recipe id
-        recipe_id = await spoonacular_search(query, max_time, client)
+    # generate recipe using gemini (running in thread since it's sync)
+    recipe_data = await asyncio.to_thread(gemini_generate_recipe_sync, query, max_time)
+    title = recipe_data.get("title", query.title()).strip()
+    
+    # generate image with the recipe title
+    image_url = await asyncio.to_thread(pollinations_image_url, title)
 
-        # now get recipe info and generate image in parallel
-        # running image generation in thread to show async usage
-        info_task = spoonacular_info(recipe_id, client)
-        img_task = asyncio.to_thread(pollinations_image_url, query)
-        # using query for now, will regenerate with title later once we have it
-        info, image_url = await asyncio.gather(info_task, img_task)
-
-    title = (info.get("title") or query.title()).strip()
-    total_time = int(info.get("readyInMinutes") or max_time)
-
-    ingredients = extract_ingredients(info)
-    instructions = extract_instructions(info)
-
-    # call gemini to get the blurb, running in thread
-    ai_blurb = await asyncio.to_thread(gemini_blurb_sync, title)
-
-    # regenerate image url with the actual recipe title instead of the query
-    image_url = pollinations_image_url(title)
+    # extract ingredients and instructions from gemini response
+    ingredients_list = recipe_data.get("ingredients", [])
+    ingredients = [Ingredient(name=ing.get("name", ""), amount=ing.get("amount", "")) 
+                   for ing in ingredients_list]
+    
+    instructions = recipe_data.get("instructions", [])
+    if not instructions:
+        instructions = ["No instructions provided."]
+    
+    total_time = int(recipe_data.get("total_time_minutes", max_time))
+    ai_blurb = recipe_data.get("blurb", "A tasty recipe generated just for you!")
 
     return RecipeResponse(
         title=title,
         image_url=image_url,
         total_time_minutes=total_time,
-        source_url=info.get("sourceUrl"),
+        source_url=None,  # no source url since it's generated
         ingredients=ingredients,
         instructions=instructions,
         ai_blurb=ai_blurb,
-        api_used="Spoonacular (recipes) + Pollinations (image) + Google AI Studio Gemini (blurb)"
+        api_used="Google AI Studio Gemini (recipe generation) + Pollinations (image generation)"
     )

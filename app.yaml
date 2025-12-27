@@ -3,7 +3,6 @@ runtime: python311
 env_variables:
   EMPL_ID: "24386186"
   LAST_NAME: "Hiba"
-  SPOONACULAR_API_KEY: "e74dd48e0a0442d694c903ff770c7c78"
   GOOGLE_AI_STUDIO_API_KEY: "AIzaSyCWzBH7W3grKzhkxePtuQK5Ljp1cYZ2OVo"
 
 entrypoint: uvicorn main:app --host 0.0.0.0 --port $PORT
