@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import re
 from typing import List, Optional, Dict
 from urllib.parse import quote
 
@@ -104,11 +105,30 @@ Return the response as valid JSON with this exact structure:
     ],
     "blurb": "A short 2-line friendly description of this recipe, keep it simple and student-like"
 }}
-
-Make sure the JSON is valid and the recipe is creative and matches the description. Include at least 3 ingredients and at least 3 steps."""
+Make sure the JSON is valid and the recipe is creative and matches the description. Include at least 3 ingredients and at least 3 steps.
+IMPORTANT: Do NOT use any Markdown formatting anywhere (no **bold**, no bullets). Each instruction step must be plain text.
+IMPORTANT: Do NOT put ingredient names inside the "amount" field. "amount" must be quantity + units only, and "name" must be the ingredient name only.
+"""
+        try:
+            resp = model.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"},
+            )
+        except Exception:
+            # Fallback for older versions
+            resp = model.generate_content(prompt)
         
-        resp = model.generate_content(prompt)
         text = (getattr(resp, "text", "") or "").strip()
+
+        # Gemini sometimes includes extra text before/after the JSON.
+        # Grab the first full JSON object if possible.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+
+        # Remove null bytes if any (rare, but can happen)
+        text = text.replace("\x00", "")
         
         # try to extract json from the response (gemini might wrap it in markdown)
         if "```json" in text:
@@ -116,7 +136,9 @@ Make sure the JSON is valid and the recipe is creative and matches the descripti
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
         
-        recipe_data = json.loads(text)
+        # `strict=False` allows literal control characters inside strings.
+        # Gemini occasionally emits raw newlines/tabs inside JSON strings.
+        recipe_data = json.loads(text, strict=False)
         return recipe_data
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Gemini returned invalid JSON: {str(e)}")
@@ -128,6 +150,31 @@ def pollinations_image_url(title: str) -> str:
     """generates an image url using pollinations api based on the recipe title"""
     prompt = f"high quality food photography of {title}, plated, natural lighting"
     return POLLINATIONS_BASE + quote(prompt)
+
+
+def _strip_markdown(s: str) -> str:
+    """Remove a few common markdown artifacts Gemini sometimes emits (e.g., **bold**)."""
+    if not s:
+        return ""
+    # remove **bold** markers
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    # remove inline backticks
+    s = s.replace("`", "")
+    return s.strip()
+
+
+def _format_ingredient_for_frontend(name: str, amount: str) -> str:
+    """Frontend currently renders only `amount`, so we combine amount+name safely here."""
+    name = (name or "").strip()
+    amount = (amount or "").strip()
+
+    if name and amount:
+        # Avoid duplication when the model already put the name inside amount
+        if name.lower() in amount.lower():
+            return amount
+        return f"{amount} {name}".strip()
+
+    return amount or name or ""
 
 
 @app.post("/recipe", response_model=RecipeResponse)
@@ -151,10 +198,35 @@ async def recipe(req: RecipeRequest):
 
     # extract ingredients and instructions from gemini response
     ingredients_list = recipe_data.get("ingredients", [])
-    ingredients = [Ingredient(name=ing.get("name", ""), amount=ing.get("amount", "")) 
-                   for ing in ingredients_list]
-    
-    instructions = recipe_data.get("instructions", [])
+    ingredients: List[Ingredient] = []
+
+    # Gemini usually returns a list of dicts, but be defensive.
+    if isinstance(ingredients_list, list):
+        for ing in ingredients_list:
+            if isinstance(ing, dict):
+                name = str(ing.get("name", "") or "")
+                amount = str(ing.get("amount", "") or "")
+                display_amount = _format_ingredient_for_frontend(name, amount)
+                ingredients.append(Ingredient(name=name.strip(), amount=display_amount))
+            else:
+                # If it returns a plain string, treat it as already, displayable.
+                s = _strip_markdown(str(ing))
+                if s:
+                    ingredients.append(Ingredient(name="", amount=s))
+
+    if not ingredients:
+        ingredients = [Ingredient(name="", amount="No ingredients provided.")]
+
+    raw_instructions = recipe_data.get("instructions", [])
+    instructions: List[str] = []
+
+    if isinstance(raw_instructions, list):
+        instructions = [_strip_markdown(str(s)) for s in raw_instructions if _strip_markdown(str(s))]
+    elif isinstance(raw_instructions, str):
+        cleaned = _strip_markdown(raw_instructions)
+        if cleaned:
+            instructions = [cleaned]
+
     if not instructions:
         instructions = ["No instructions provided."]
     
